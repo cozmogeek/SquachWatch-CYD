@@ -398,35 +398,39 @@ static void* bigAlloc(size_t bytes) {
 }
 
 #if defined(CYD)
-// 64 frames is 4 ms. The mix is malloc'd while the card is mounted, and the
-// largest block then settles around 5 KB. A 256-frame stereo buffer plus a
-// 4 KB player task does not fit, so the first sound is the only one that
-// starts.
+// 64 frames is 4 ms. Nothing here comes off the heap. The card logger pauses
+// when the largest block drops under 4 KB, and it does not free its own
+// buffers to recover, so a mix allocated for the length of a sound left the
+// row on LOW MEMORY after the scanner had filled the hole.
 static const int CYD_CHUNK = 64;
-struct PartRun {
-    int at, N;
-    bool live;
-    ToneRun tone;
-    VoiceRun voice;
-    AirRun air;
-};
-struct DacWs {
-    PartRun run[8];
-    float   chunk[CYD_CHUNK];
-};
-static_assert(sizeof(DacWs) <= 2048, "CYD sound workspace has to fit in the block a mounted card leaves");
+struct RunHead { int at, N; bool live; };
+static RunHead  s_run[8];
+static ToneRun  s_tone[8];
+static VoiceRun s_voice;
+static AirRun   s_air;
+static_assert(sizeof(s_run) + sizeof(s_tone) + sizeof(s_voice) + sizeof(s_air) <= 512,
+              "CYD sound state has to stay out of the block the card logger watches");
 
-static void addPart(const Part& st, PartRun& run, float* chunk, int base, int n) {
+static void addPart(const Part& st, int pi, float* chunk, int base, int n) {
+    const RunHead& run = s_run[pi];
     const int from = base > run.at ? base : run.at;
     const int to = base + n < run.at + run.N ? base + n : run.at + run.N;
     if (from >= to) return;
     float* out = chunk + (from - base);
     const int n0 = from - run.at, count = to - from;
     switch (st.kind) {
-        case VOICE: renderVoice(st, out, n0, count, run.N, run.voice); break;
-        case BELL:  renderBell(st, out, n0, count, run.N); break;
-        case AIR:   renderAir(st, out, n0, count, run.N, run.air); break;
-        default:    renderTone(st, out, n0, count, run.N, run.tone); break;
+        case VOICE:
+            // One voice at a time. A later voice in the same sound starts at
+            // its own n0 of 0 and takes the state over.
+            if (n0 == 0) { s_voice = VoiceRun{}; s_voice.r.s = 777; }
+            renderVoice(st, out, n0, count, run.N, s_voice);
+            break;
+        case BELL: renderBell(st, out, n0, count, run.N); break;
+        case AIR:
+            if (n0 == 0) { s_air = AirRun{}; s_air.r.s = 4242; }
+            renderAir(st, out, n0, count, run.N, s_air);
+            break;
+        default: renderTone(st, out, n0, count, run.N, s_tone[pi]); break;
     }
 }
 
@@ -441,26 +445,19 @@ static void emitDac(uint8_t v, uint32_t& clock, uint32_t step) {
 
 static void playNowDac(const Sound& snd, const int* start, uint8_t parts, int total) {
     s_cut = false;
-    DacWs* ws = (DacWs*)malloc(sizeof(DacWs));
-    if (!ws) {
-        Serial.printf("[sound] no memory for the sound, largest %lu\n",
-                      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        return;
-    }
+    memset(s_run, 0, sizeof s_run);
     for (uint8_t i = 0; i < parts; i++) {
         const Part& st = snd.p[i];
-        PartRun& r = ws->run[i];
-        r.at = start[i] * (int)RATE / 1000;
-        r.N = partMs(st) * (int)RATE / 1000;
-        r.live = r.at >= 0 && r.N > 0 && r.at + r.N <= total;
-        r.tone = ToneRun{ 0, 0x5EED1234u, 0 };
-        r.voice = VoiceRun{};
-        r.voice.r.s = 777;
-        r.air = AirRun{};
-        r.air.r.s = 4242;
+        s_run[i].at = start[i] * (int)RATE / 1000;
+        s_run[i].N = partMs(st) * (int)RATE / 1000;
+        s_run[i].live = s_run[i].at >= 0 && s_run[i].N > 0 && s_run[i].at + s_run[i].N <= total;
+        s_tone[i] = ToneRun{ 0, 0x5EED1234u, 0 };
     }
-    const int D = snd.echoMs ? snd.echoMs * (int)RATE / 1000 : 0;
-    float* echo = D ? (float*)malloc((size_t)D * sizeof(float)) : nullptr;
+    // No echo buffer on this board. The whoop's delay line is about 12 KB and
+    // the visitor's is about 4 KB, either of which is the whole block the
+    // card logger is watching. The sound plays dry.
+    const int D = 0;
+    float* echo = nullptr;
     if (echo) memset(echo, 0, (size_t)D * sizeof(float));
     int ei = 0;
 
@@ -472,10 +469,11 @@ static void playNowDac(const Sound& snd, const int* start, uint8_t parts, int to
     for (int i = 0; i < 8 * (int)RATE / 1000; i++) emitDac(128, clock, step);
     for (int base = 0; base < total && !s_cut; ) {
         const int n = (total - base) < CYD_CHUNK ? (total - base) : CYD_CHUNK;
-        memset(ws->chunk, 0, (size_t)n * sizeof(float));
-        for (uint8_t i = 0; i < parts; i++) if (ws->run[i].live) addPart(snd.p[i], ws->run[i], ws->chunk, base, n);
+        float chunk[CYD_CHUNK];
+        memset(chunk, 0, (size_t)n * sizeof(float));
+        for (uint8_t i = 0; i < parts; i++) if (s_run[i].live) addPart(snd.p[i], i, chunk, base, n);
         for (int i = 0; i < n; i++) {
-            float sample = ws->chunk[i];
+            float sample = chunk[i];
             if (echo) {
                 const float z = echo[ei];
                 echo[ei] = sample + z * snd.fb;
@@ -493,7 +491,6 @@ static void playNowDac(const Sound& snd, const int* start, uint8_t parts, int to
     }
     free(echo);
     for (int i = 0; i < 12 * (int)RATE / 1000 && !s_cut; i++) emitDac(128, clock, step);
-    free(ws);
 }
 #endif
 

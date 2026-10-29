@@ -36,13 +36,12 @@ namespace Wardrive {
 
 namespace {
 
-// Pause only under 4 KB. Measured on this board with the card mounted: the
-// largest block is 11.2 KB, 7.7 KB once these buffers exist, and it settles
-// at 5.1 KB once the scanner is running. That 2.5 KB does not come back, and
-// pausing leaves the buffers allocated, so the row would sit on LOW MEMORY
-// while the scanner stays just as tight. 4 KB is below the 5 KB where a
-// board under real pressure sat, so detection has already gone passive.
-const uint32_t PRESSURE_FLOOR_B = 4096;
+// Pause only under 1.2 KB. Measured on this board, this boot: the buffers
+// come up with the largest block at 4596, and the scanner then takes it to
+// 2420. That drop does not come back, and pausing leaves the buffers
+// allocated, so a line above 2420 sits on LOW MEMORY while the scanner stays
+// just as tight. 1.2 KB is below where this boot settled.
+const uint32_t PRESSURE_FLOOR_B = 1280;
 const uint16_t ROWS_B   = 512;      // the row buffer, about three rows
 const uint16_t ROW_MAX  = 320;      // one csvRow() always fits in this
 const uint32_t FLUSH_MS = 2000;     // the longest a row waits for the card
