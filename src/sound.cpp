@@ -31,9 +31,6 @@
 #include <math.h>
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
-#if defined(CYD)
-#include <driver/dac.h>
-#endif
 #include "settings.h"
 #include "clock.h"
 
@@ -67,7 +64,8 @@ static volatile bool s_hush    = false;
 static QueueHandle_t s_q       = nullptr;
 static TaskHandle_t  s_task    = nullptr;
 #if defined(CYD)
-static portMUX_TYPE  s_mux     = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_busy    = false;
+static volatile bool s_cut     = false;
 #endif
 
 // ---- the sounds ------------------------------------------------------------
@@ -200,10 +198,11 @@ static bool codecInit() {
 // ---- the amplifier ---------------------------------------------------------
 static void amp(bool on) {
 #if defined(CYD)
-    // DAC channel 2 is GPIO26, the amp input. Channel 1 is GPIO25, the touch
-    // clock: i2s_set_dac_mode() enables it too, so it is never called.
-    if (on) { dac_i2s_enable(); dac_output_enable(DAC_CHANNEL_2); }
-    else    { dac_output_disable(DAC_CHANNEL_2); dac_i2s_disable(); }
+    // The pad is GPIO26, driven directly with dacWrite while a sound plays.
+    // I2S DAC mode is what was buzzing: it clocked the sample out as a buzz
+    // no matter which wave was in the buffer. Leaving the mode alone keeps
+    // GPIO25 the touch clock.
+    (void)on;
 #else
     if (PIN_AMP >= 0) digitalWrite(PIN_AMP, (on == s_ampLow) ? LOW : HIGH);
 #endif
@@ -334,14 +333,43 @@ static void renderVoice(const Part& st, float* out, int n0, int count, int N, Vo
 }
 
 static void renderBell(const Part& st, float* out, int n0, int count, int N) {
-    const float fc = st.p[0], fm = fc * st.k[0], I = st.k[1], ring = st.k[2] / 1000.0f;
-    const float ie = ring * (st.k[3] > 0 ? st.k[3] : 0.5f), lv = st.lv / 100.0f;
+    const float fc0 = st.p[0], ring = st.k[2] / 1000.0f, lv = st.lv / 100.0f;
     const int end = n0 + count;
+#if defined(CYD)
+    // The modulator sits at 3.5 times the note, 5–7 kHz. This DAC is 8 bits
+    // and the speaker is a few millimetres across, so that is a buzz that
+    // rises and then fades. A damped sine, an octave down when the note is
+    // up in that range, is the chime.
+    const float fc = fc0 > 1000.0f ? fc0 * 0.5f : fc0;
     for (int n = n0; n < end; n++) {
         const float t = (float)n / RATE;
-        const float v = sinf(TAU_F * fc * t + I * expf(-t / ie) * sinf(TAU_F * fm * t));
+        out[n - n0] += sinf(TAU_F * fc * t) * 0.65f * envRing(st, n, N, ring) * lv;
+    }
+#else
+    const float fm = fc0 * st.k[0], I = st.k[1];
+    const float ie = ring * (st.k[3] > 0 ? st.k[3] : 0.5f);
+    for (int n = n0; n < end; n++) {
+        const float t = (float)n / RATE;
+        const float v = sinf(TAU_F * fc0 * t + I * expf(-t / ie) * sinf(TAU_F * fm * t));
         out[n - n0] += v * 0.55f * envRing(st, n, N, ring) * lv;
     }
+#endif
+}
+
+// A 45 ms blip rings into the next one on the CYD speaker, so the three
+// rising notes of an alert become one chirp. A single-pitch blip is given
+// three times the room. Glides and the longer sounds stay as they are.
+static int partMs(const Part& st) {
+#if defined(CYD)
+    if (st.kind == TONE && st.ms && st.ms < 80 && st.p[1] == 0) return (int)st.ms * 3;
+#endif
+    return st.ms;
+}
+static int partGap(const Part& st) {
+#if defined(CYD)
+    if (st.kind == TONE && st.ms && st.ms < 80 && st.p[1] == 0) return (int)st.gap * 3;
+#endif
+    return st.gap;
 }
 
 static void renderAir(const Part& st, float* out, int n0, int count, int N, AirRun& run) {
@@ -370,10 +398,11 @@ static void* bigAlloc(size_t bytes) {
 }
 
 #if defined(CYD)
-// One part's place in the mix, and the oscillator state that has to survive
-// from one 16 ms chunk to the next. Held only while a sound plays: a mounted
-// card leaves one block of about 10.7 KB, wardriving pauses under 8 KB, and
-// these buffers plus a task stack are most of that gap.
+// 64 frames is 4 ms. The mix is malloc'd while the card is mounted, and the
+// largest block then settles around 5 KB. A 256-frame stereo buffer plus a
+// 4 KB player task does not fit, so the first sound is the only one that
+// starts.
+static const int CYD_CHUNK = 64;
 struct PartRun {
     int at, N;
     bool live;
@@ -382,10 +411,10 @@ struct PartRun {
     AirRun air;
 };
 struct DacWs {
-    PartRun  run[8];
-    float    chunk[CHUNK];
-    uint16_t dac[CHUNK * 2];
+    PartRun run[8];
+    float   chunk[CYD_CHUNK];
 };
+static_assert(sizeof(DacWs) <= 2048, "CYD sound workspace has to fit in the block a mounted card leaves");
 
 static void addPart(const Part& st, PartRun& run, float* chunk, int base, int n) {
     const int from = base > run.at ? base : run.at;
@@ -401,52 +430,28 @@ static void addPart(const Part& st, PartRun& run, float* chunk, int base, int n)
     }
 }
 
-// Stereo frames, the same sample in both slots. Only the left slot reaches
-// the amp (DAC2, GPIO26). Midscale is silence: the DAC reads the high byte.
-static void writeDac(uint16_t* dac, int frames) {
-    size_t done = 0;
-    i2s_write(PORT, dac, (size_t)frames * 4, &done, portMAX_DELAY);
-}
-static void dacSilence(uint16_t* dac, int ms) {
-    for (int i = 0; i < CHUNK * 2; i++) dac[i] = 0x8000;
-    for (int left = ms * (int)RATE / 1000; left > 0; left -= CHUNK)
-        writeDac(dac, left < CHUNK ? left : CHUNK);
-}
-
-// Installed for one sound and removed after it. Left up, its four 1 KB DMA
-// buffers come out of the 10.7 KB block a mounted card leaves, and wardriving
-// then sits on LOW MEMORY: it pauses once the largest block falls under 8 KB.
-static bool dacInstall() {
-    i2s_config_t cfg = {};
-    cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
-    cfg.sample_rate          = RATE;
-    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
-    cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
-    cfg.communication_format = I2S_COMM_FORMAT_STAND_MSB;
-    cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count        = 4;
-    cfg.dma_buf_len          = CHUNK;
-    cfg.use_apll             = false;
-    cfg.tx_desc_auto_clear   = true;
-    cfg.fixed_mclk           = 0;
-    cfg.mclk_multiple        = I2S_MCLK_MULTIPLE_256;
-    cfg.bits_per_chan        = I2S_BITS_PER_CHAN_16BIT;
-    return i2s_driver_install(PORT, &cfg, 0, nullptr) == ESP_OK;
+// Straight to the pad. I2S kept turning every wave into the same buzz, so
+// the chime and the beeps never changed when the notes did. dacWrite sets
+// GPIO26's voltage one sample at a time and does not touch GPIO25.
+static void emitDac(uint8_t v, uint32_t& clock, uint32_t step) {
+    dacWrite(26, v);
+    clock += step;
+    while ((int32_t)(micros() - clock) < 0) {}
 }
 
 static void playNowDac(const Sound& snd, const int* start, uint8_t parts, int total) {
+    s_cut = false;
     DacWs* ws = (DacWs*)malloc(sizeof(DacWs));
-    if (!ws) { Serial.println("[sound] no memory for the sound"); return; }
-    if (!dacInstall()) {
-        Serial.println("[sound] I2S DAC refused");
-        free(ws);
+    if (!ws) {
+        Serial.printf("[sound] no memory for the sound, largest %lu\n",
+                      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         return;
     }
     for (uint8_t i = 0; i < parts; i++) {
         const Part& st = snd.p[i];
         PartRun& r = ws->run[i];
         r.at = start[i] * (int)RATE / 1000;
-        r.N = st.ms * (int)RATE / 1000;
+        r.N = partMs(st) * (int)RATE / 1000;
         r.live = r.at >= 0 && r.N > 0 && r.at + r.N <= total;
         r.tone = ToneRun{ 0, 0x5EED1234u, 0 };
         r.voice = VoiceRun{};
@@ -459,15 +464,14 @@ static void playNowDac(const Sound& snd, const int* start, uint8_t parts, int to
     if (echo) memset(echo, 0, (size_t)D * sizeof(float));
     int ei = 0;
 
+    // 8-bit pad, linear. Squaring the 25% default leaves a whisper.
     const float pct = (float)Settings::soundVolume() / 100.0f;
-    const float vol = pct * pct * 32000.0f, g = snd.gain > 0 ? snd.gain : 1.0f;
-
-    i2s_start(PORT);
-    dacSilence(ws->dac, 24);  // clocks and midscale before the pad connects: no pop
-    amp(true);
-    dacSilence(ws->dac, 16);
-    for (int base = 0; base < total; ) {
-        const int n = (total - base) < CHUNK ? (total - base) : CHUNK;
+    const float vol = pct * 120.0f, g = snd.gain > 0 ? snd.gain : 1.0f;
+    const uint32_t step = 1000000u / RATE;
+    uint32_t clock = micros();
+    for (int i = 0; i < 8 * (int)RATE / 1000; i++) emitDac(128, clock, step);
+    for (int base = 0; base < total && !s_cut; ) {
+        const int n = (total - base) < CYD_CHUNK ? (total - base) : CYD_CHUNK;
         memset(ws->chunk, 0, (size_t)n * sizeof(float));
         for (uint8_t i = 0; i < parts; i++) if (ws->run[i].live) addPart(snd.p[i], ws->run[i], ws->chunk, base, n);
         for (int i = 0; i < n; i++) {
@@ -481,21 +485,14 @@ static void playNowDac(const Sound& snd, const int* start, uint8_t parts, int to
             const float v = sample * g, a = fabsf(v);
             const float o = a < 0.7f ? v : copysignf(0.7f + 0.3f * tanhf((a - 0.7f) / 0.3f), v);
             int s = (int)(o * vol);
-            if (s > 32767) s = 32767;
-            if (s < -32768) s = -32768;
-            const uint16_t u = (uint16_t)(s + 32768);
-            ws->dac[i * 2] = u; ws->dac[i * 2 + 1] = u;
+            if (s > 127) s = 127;
+            if (s < -127) s = -127;
+            emitDac((uint8_t)(s + 128), clock, step);
         }
-        writeDac(ws->dac, n);
         base += n;
     }
     free(echo);
-    dacSilence(ws->dac, 16);
-    amp(false);
-    dacSilence(ws->dac, 24);
-    i2s_zero_dma_buffer(PORT);
-    i2s_stop(PORT);
-    i2s_driver_uninstall(PORT);
+    for (int i = 0; i < 12 * (int)RATE / 1000 && !s_cut; i++) emitDac(128, clock, step);
     free(ws);
 }
 #endif
@@ -507,9 +504,10 @@ static void playNow(Id id) {
     int start[8], t = 0, last = 0;
     for (uint8_t i = 0; i < parts; i++) {
         const Part& st = snd.p[i];
+        const int ms = partMs(st), gap = partGap(st);
         start[i] = ((st.flags & WITH) ? last : t) + st.off;
         last = start[i];
-        if (start[i] + st.ms + st.gap > t) t = start[i] + st.ms + st.gap;
+        if (start[i] + ms + gap > t) t = start[i] + ms + gap;
     }
     const int total = (t + snd.echoMs * 6 + 30) * (int)RATE / 1000;
 #if defined(CYD)
@@ -594,62 +592,26 @@ static void playNow(Id id) {
     i2s_stop(PORT);
 }
 
+#if !defined(CYD)
 static void soundTask(void*) {
     uint8_t id;
     for (;;) {
-#if defined(CYD)
-        // Idle a tenth of a second, then leave. The stack is the block
-        // wardriving is measured against, so it cannot sit there between sounds.
-        if (xQueueReceive(s_q, &id, pdMS_TO_TICKS(100)) != pdTRUE) {
-            bool leave = false;
-            portENTER_CRITICAL(&s_mux);
-            if (s_task == xTaskGetCurrentTaskHandle()) {
-                s_task = nullptr;
-                leave = true;
-            }
-            portEXIT_CRITICAL(&s_mux);
-            if (leave) vTaskDelete(nullptr);
-            continue;
-        }
-#else
         if (xQueueReceive(s_q, &id, portMAX_DELAY) != pdTRUE) continue;
-#endif
         if (id < (uint8_t)Id::COUNT) playNow((Id)id);
     }
-}
-
-#if defined(CYD)
-// The queue and the task exist only around a sound. Claimed with a stand-in
-// handle so a second play during the create does not start a second task.
-static void ensurePlayer() {
-    portENTER_CRITICAL(&s_mux);
-    const bool start = s_task == nullptr;
-    if (start) s_task = (TaskHandle_t)1;
-    portEXIT_CRITICAL(&s_mux);
-    if (!start) return;
-    if (!s_q) s_q = xQueueCreate(4, sizeof(uint8_t));
-    TaskHandle_t created = nullptr;
-    const BaseType_t ok = s_q
-        ? xTaskCreatePinnedToCore(soundTask, "sound", 4096, nullptr, 2, &created, 1)
-        : pdFAIL;
-    portENTER_CRITICAL(&s_mux);
-    s_task = (ok == pdPASS) ? created : nullptr;
-    portEXIT_CRITICAL(&s_mux);
-    if (ok != pdPASS) Serial.println("[sound] no memory for the player");
 }
 #endif
 
 // ---- the API ---------------------------------------------------------------
 void begin() {
 #if defined(CYD)
-    // Built-in DAC, not a codec. Do not call i2s_set_pin(NULL) or
-    // i2s_set_dac_mode(): both turn on DAC1, and that pad is GPIO25, the
-    // touch clock. The amp is DAC2, GPIO26. Nothing is allocated here: the
-    // driver, the mix buffer and the player task are created for one sound
-    // and freed after it, because a mounted card leaves one block of about
-    // 10.7 KB and wardriving pauses once that block falls under 8 KB.
+    // Built-in DAC, not a codec. Do not call i2s_set_pin(NULL): that turns on
+    // both DACs, and DAC1 is GPIO25, the touch clock. The amp is DAC2,
+    // GPIO26, enabled only while a sound plays. Playback runs on the caller.
+    // A player task's 4 KB stack does not fit in the block left once the
+    // card is mounted.
     s_ok = true;
-    Serial.println("[sound] CYD amp on DAC2 GPIO26, brought up only while a sound plays");
+    Serial.println("[sound] CYD amp on DAC2 GPIO26");
 #else
     if (PIN_AMP >= 0) pinMode(PIN_AMP, OUTPUT);
     amp(false);
@@ -713,18 +675,27 @@ void play(Id id, bool sample) {
         if (s_hush) return;
         if (Clock::night() && id != Id::WATCH_HIT) return;
     }
-    const uint8_t b = (uint8_t)id;
 #if defined(CYD)
-    ensurePlayer();
-    if (!s_task || !s_q) return;
-#endif
+    // On the caller. The player task's stack was the allocation that failed
+    // once the card was mounted, so a detection made no sound and the next
+    // try never started.
+    if (s_busy) return;
+    s_busy = true;
+    playNow(id);
+    s_busy = false;
+#else
+    const uint8_t b = (uint8_t)id;
     xQueueSend(s_q, &b, 0);        // a full queue drops the sound, not the frame
+#endif
 }
 
 void hush(bool on) { s_hush = on; }
 
 void quiet() {
     if (!s_ok) return;
+#if defined(CYD)
+    s_cut = true;
+#endif
     if (s_q) xQueueReset(s_q);
     amp(false);
 }
