@@ -36,9 +36,13 @@ namespace Wardrive {
 
 namespace {
 
-// The scanner's SCAN_FLUSH_BLOCK_B in detection.cpp: wardriving gives way at
-// the point where detection starts fighting for heap.
-const uint32_t PAUSE_BLOCK_B = 8192;
+// Pause only under 4 KB. Measured on this board with the card mounted: the
+// largest block is 11.2 KB, 7.7 KB once these buffers exist, and it settles
+// at 5.1 KB once the scanner is running. That 2.5 KB does not come back, and
+// pausing leaves the buffers allocated, so the row would sit on LOW MEMORY
+// while the scanner stays just as tight. 4 KB is below the 5 KB where a
+// board under real pressure sat, so detection has already gone passive.
+const uint32_t PRESSURE_FLOOR_B = 4096;
 const uint16_t ROWS_B   = 512;      // the row buffer, about three rows
 const uint16_t ROW_MAX  = 320;      // one csvRow() always fits in this
 const uint32_t FLUSH_MS = 2000;     // the longest a row waits for the card
@@ -290,13 +294,25 @@ void sdTick(uint32_t nowMs, bool cardMounted) {
             release();
             s_allocFailed = true;
             s_retryAt = nowMs + RETRY_MS;
+            static bool said = false;
+            if (!said) {
+                said = true;
+                Serial.printf("[wardrive] buffers would not fit: largest block %lu\n",
+                              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            }
             return;
         }
         s_allocFailed = false;
+        Serial.printf("[wardrive] buffers up, largest block %lu\n",
+                      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
     if (!s_heapAt || nowMs - s_heapAt >= HEAP_MS) {
         s_heapAt = nowMs ? nowMs : 1;
-        s_paused = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < PAUSE_BLOCK_B;
+        const uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        const bool pause = largest < PRESSURE_FLOOR_B;
+        if (pause && !s_paused)
+            Serial.printf("[wardrive] paused: largest block %lu\n", (unsigned long)largest);
+        s_paused = pause;
     }
     drain(nowMs);
     if (s_rowCount && nowMs - s_rowSince >= FLUSH_MS) flush();

@@ -7,7 +7,7 @@
 // The speaker's two rows: on the boards with one, and in the emulator, where
 // they are listed only with SQUACHSIM_SPEAKER set (for the release clip) so
 // the web emulator never offers a sound it cannot make.
-#if defined(FREENOVE_S3) || defined(FREENOVE_S3_35) || defined(TDECK_PLUS) || !defined(ESP32)
+#if defined(FREENOVE_S3) || defined(FREENOVE_S3_35) || defined(TDECK_PLUS) || defined(CYD) || !defined(ESP32)
 #define SQW_SOUND_ROWS 1
 #else
 #define SQW_SOUND_ROWS 0
@@ -79,7 +79,7 @@ enum class SettingsRow : uint8_t {
     BUZZER,          // the CrowPanel 7 only, the one board with a buzzer: OFF, or NEW ONLY
 #endif
 #if SQW_SOUND_ROWS
-    SOUND,           // the Freenove S3 boards, which have a speaker: OFF, ALERTS or ALL
+    SOUND,           // boards with a speaker: OFF, ALERTS or ALL
     SOUND_VOLUME,    // and how loud: 0-100% on its - and + buttons
 #endif
 #if SQW_WIFI_5G

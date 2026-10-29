@@ -91,9 +91,9 @@ cell protection; that is not evidence that the board provides compatible
 charge management. Details are in [DIYMALLS-28.md](DIYMALLS-28.md).
 
 The USB-C connector provides the board's USB/data connection and 5 V input.
-The board also has a two-pin speaker connector, but its mapping and electrical
-requirements have not been verified for this model; the shared CYD firmware
-does not drive it.
+The shared CYD firmware drives GPIO 26 as the ESP32's DAC2 into the onboard
+amplifier whenever SOUND is not OFF. On the original ESP32-2432S028R that is
+the speaker connector. This model's connector is treated the same way.
 
 ## Spare GPIOs
 

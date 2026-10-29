@@ -2,9 +2,12 @@
 //
 // The two Freenove S3 boards carry an ES8311 codec on the touch controller's
 // I2C bus and a small mono amplifier behind it, with a speaker plug on the
-// edge. Nothing else in the fleet has a speaker; this header is a set of
-// no-ops everywhere else, so the pets and the mascot can ask for a sound
-// without knowing whether anything is listening.
+// edge. The T-Deck Plus has a MAX98357A on I2S. The original 2.8" CYD
+// (ESP32-2432S028R, and the JC2432W328C that shares its firmware) has an
+// onboard amp fed by the ESP32's DAC2 on GPIO26; GPIO25 is the touch clock
+// and is never a DAC pin. Everywhere else this header is a set of no-ops,
+// so the pets and the mascot can ask for a sound without knowing whether
+// anything is listening.
 //
 // Every sound is made on the fly from a short recipe (tones, a little voice,
 // FM bells, filtered air, an echo), picked in the two Sound Labs of
@@ -18,10 +21,17 @@
 #pragma once
 #include <stdint.h>
 
-#if defined(FREENOVE_S3) || defined(FREENOVE_S3_35) || defined(TDECK_PLUS)
+#if defined(FREENOVE_S3) || defined(FREENOVE_S3_35) || defined(TDECK_PLUS) || defined(CYD)
 #define SQW_SPEAKER 1
 #else
 #define SQW_SPEAKER 0
+#endif
+// Deep-sleep POWER OFF belongs to the battery handhelds. The CYD's speaker
+// does not take the BOOT long-press; that stays CHARGE MODE.
+#if defined(FREENOVE_S3) || defined(FREENOVE_S3_35) || defined(TDECK_PLUS)
+#define SQW_POWER_OFF 1
+#else
+#define SQW_POWER_OFF 0
 #endif
 
 namespace Sound {

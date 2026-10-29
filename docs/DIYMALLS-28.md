@@ -70,10 +70,10 @@ behavior on every JC2432W328C revision has not been confirmed here.
 | MOSI | 23 |
 | CS | 5 |
 
-The board has a speaker connector, but SquachWatch does not use it on the
-shared CYD build. Its connector-to-GPIO mapping and electrical drive
-requirements have not been verified for this model. Do not infer them from
-the original CYD or Freenove board.
+The shared CYD firmware drives GPIO 26 as the ESP32's DAC2 into an onboard
+amplifier when SOUND is not OFF. That is the original ESP32-2432S028R's
+speaker connector. This board's connector is on the same GPIO in Guition's
+pin table; SOUND stays OFF until it is switched on.
 
 ## Battery and USB power
 
@@ -129,8 +129,8 @@ the board-specific GPIO27 backlight handling intact.
 - Find a board schematic or safely measure whether BAT voltage reaches a
   suitable ADC input, and identify any charger/power-management IC before
   documenting charging support or adding battery telemetry.
-- Verify the speaker connector pinout and electrical requirements before
-  enabling audio on this board.
+- Confirm the speaker connector on a JC2432W328C by turning SOUND to ALERTS
+  and listening at the plug. GPIO 26 is what the shared firmware drives.
 
 ## References
 

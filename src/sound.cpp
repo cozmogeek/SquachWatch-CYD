@@ -1,9 +1,9 @@
-// SquachWatch-CYD — the speaker on the Freenove S3 boards. See sound.h.
+// SquachWatch-CYD — the speaker. See sound.h.
 //
-// The hardware, from Freenove's schematics and their Sketch_07.1_Music: an
-// ES8311 codec at I2C 0x18 on the touch bus, fed over I2S, driving a small
-// mono amplifier whose SHUTDOWN pin is GPIO1 on both boards (AUDIO_EN on the
-// schematic; their sketch drives it LOW to play). The I2S pins differ:
+// Freenove, from their schematics and Sketch_07.1_Music: an ES8311 codec at
+// I2C 0x18 on the touch bus, fed over I2S, driving a small mono amplifier
+// whose SHUTDOWN pin is GPIO1 on both boards (AUDIO_EN on the schematic;
+// their sketch drives it LOW to play). The I2S pins differ:
 //
 //   2.8" (FNK0104B): MCK 4, BCK 5, WS 7, DOUT 8, DIN 6
 //   3.5" (FNK0104N): MCK 17, BCK 18, WS 21, DOUT 15, DIN 16
@@ -17,11 +17,13 @@
 // which also means an idle board spends nothing on sound: the amp is in
 // shutdown (under a microamp) and the I2S clocks are stopped.
 //
-// Playback is a small FreeRTOS task fed by a queue. It renders the whole
-// sound into PSRAM, then streams it 256 frames at a time into the I2S
-// driver's DMA buffers and blocks on the write, so a slow frame on the
-// drawing side never puts a gap in a sound. Four 256-frame buffers is 64 ms
-// of DMA, 4 KB of internal RAM.
+// Playback is a small FreeRTOS task fed by a queue. On the codec boards it
+// renders the whole sound into PSRAM, then streams it 256 frames at a time
+// into the I2S driver's DMA buffers and blocks on the write, so a slow frame
+// on the drawing side never puts a gap in a sound. Four 256-frame buffers is
+// 64 ms of DMA, 4 KB of internal RAM. The 2.8" CYD has no PSRAM and its
+// framebuffer already owns the largest internal block, so that board renders
+// each chunk as it plays, into the onboard amp on DAC2 (GPIO26).
 #include "sound.h"
 #if SQW_SPEAKER
 #include <Arduino.h>
@@ -29,6 +31,9 @@
 #include <math.h>
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
+#if defined(CYD)
+#include <driver/dac.h>
+#endif
 #include "settings.h"
 #include "clock.h"
 
@@ -61,6 +66,9 @@ static bool          s_ampLow  = true;        // the amp plays with the pin LOW
 static volatile bool s_hush    = false;
 static QueueHandle_t s_q       = nullptr;
 static TaskHandle_t  s_task    = nullptr;
+#if defined(CYD)
+static portMUX_TYPE  s_mux     = portMUX_INITIALIZER_UNLOCKED;
+#endif
 
 // ---- the sounds ------------------------------------------------------------
 // A sound is a short list of parts, played one after another unless a part is
@@ -190,7 +198,16 @@ static bool codecInit() {
 }
 
 // ---- the amplifier ---------------------------------------------------------
-static void amp(bool on) { if (PIN_AMP >= 0) digitalWrite(PIN_AMP, (on == s_ampLow) ? LOW : HIGH); }
+static void amp(bool on) {
+#if defined(CYD)
+    // DAC channel 2 is GPIO26, the amp input. Channel 1 is GPIO25, the touch
+    // clock: i2s_set_dac_mode() enables it too, so it is never called.
+    if (on) { dac_i2s_enable(); dac_output_enable(DAC_CHANNEL_2); }
+    else    { dac_output_disable(DAC_CHANNEL_2); dac_i2s_disable(); }
+#else
+    if (PIN_AMP >= 0) digitalWrite(PIN_AMP, (on == s_ampLow) ? LOW : HIGH);
+#endif
+}
 
 // ---- rendering -------------------------------------------------------------
 // The whole sound is rendered into a float buffer in PSRAM first (every board
@@ -253,81 +270,86 @@ static float envRing(const Part& st, int n, int N, float ringS) {
     return e;
 }
 
-static void renderTone(const Part& st, float* out, int N, uint32_t& lcg, float& lp) {
+// Carried across chunks so a sound can be rendered as it plays. A full-buffer
+// render starts these at zero (and the shared noise seed) and runs n = 0..N.
+struct ToneRun { float ph; uint32_t lcg; float lp; };
+struct VoiceRun { float ph, prev, jit; Rng r; float c[3][4]; float z[3][4]; };
+struct AirRun { Rng r; float c[4]; float z[4]; };
+
+static void renderTone(const Part& st, float* out, int n0, int count, int N, ToneRun& run) {
     const float lv = st.lv / 100.0f;
-    float ph = 0;
-    for (int n = 0; n < N; n++) {
+    const int end = n0 + count;
+    for (int n = n0; n < end; n++) {
         const float t = (float)n / RATE;
         float f = along(st.p, (float)n / N);
         if (st.k[0] > 0) f *= 1 + st.k[0] * sinf(TAU_F * st.k[1] * t) * (st.k[2] > 0 ? expf(-t * 1000 / st.k[2]) : 1);
         float v;
         if (st.kind == NOISE) {
-            lcg = lcg * 1664525u + 1013904223u;
-            lp += 0.25f * (((int32_t)(lcg >> 8) / 8388608.0f) - 1.0f - lp);   // one-pole low-pass
-            v = lp * 0.9f;
+            run.lcg = run.lcg * 1664525u + 1013904223u;
+            run.lp += 0.25f * (((int32_t)(run.lcg >> 8) / 8388608.0f) - 1.0f - run.lp);   // one-pole low-pass
+            v = run.lp * 0.9f;
         } else switch (st.wave) {
-            case SQ:  v = ph < 0.5f ? 0.35f : -0.35f; break;
-            case TRI: v = (ph < 0.5f ? (ph * 4.0f - 1.0f) : (3.0f - ph * 4.0f)) * 0.7f; break;
-            case SIN: v = sinf(ph * TAU_F) * 0.7f; break;
-            default:  v = (ph * 2.0f - 1.0f) * 0.4f; break;
+            case SQ:  v = run.ph < 0.5f ? 0.35f : -0.35f; break;
+            case TRI: v = (run.ph < 0.5f ? (run.ph * 4.0f - 1.0f) : (3.0f - run.ph * 4.0f)) * 0.7f; break;
+            case SIN: v = sinf(run.ph * TAU_F) * 0.7f; break;
+            default:  v = (run.ph * 2.0f - 1.0f) * 0.4f; break;
         }
-        out[n] += v * envLin(st, n, N) * lv;
-        ph += f / RATE;
-        if (ph >= 1.0f) ph -= 1.0f;
+        out[n - n0] += v * envLin(st, n, N) * lv;
+        run.ph += f / RATE;
+        if (run.ph >= 1.0f) run.ph -= 1.0f;
     }
 }
 
 // A throat: a Rosenberg glottal pulse at the pitch, its slope (what the mouth
 // hears) through three resonances that glide between the vowels, plus breath.
-static void renderVoice(const Part& st, float* out, int N) {
-    Rng r = { 777 };
+static void renderVoice(const Part& st, float* out, int n0, int count, int N, VoiceRun& run) {
     const float sz = st.k[0] > 0 ? st.k[0] : 1.0f, br = st.k[1], vd = st.k[3], lv = st.lv / 100.0f;
     const int h0 = (int)(st.k[2] * RATE / 1000);
     const int nv = pts(st.v);
-    float ph = 0, prev = 0, jit = 0, c[3][4] = {}, z[3][4] = {};
-    for (int n = 0; n < N; n++) {
+    const int end = n0 + count;
+    for (int n = n0; n < end; n++) {
         const float u = (float)n / N, t = (float)n / RATE;
-        jit += (r.next() * 0.5f - jit) * 0.02f;
-        const float f0 = along(st.p, u) * (1 + 0.012f * sinf(TAU_F * 5.2f * t) + 0.01f * jit + vd * sinf(TAU_F * 6 * t));
-        ph += f0 / RATE;
-        if (ph >= 1.0f) ph -= 1.0f;
-        const float pu = ph < 0.4f ? 0.5f - 0.5f * cosf(3.1415927f * ph / 0.4f)
-                       : ph < 0.56f ? cosf(1.5707963f * (ph - 0.4f) / 0.16f) : 0.0f;
-        float e = (pu - prev) * RATE / (f0 * 7.85f);
-        prev = pu;
+        run.jit += (run.r.next() * 0.5f - run.jit) * 0.02f;
+        const float f0 = along(st.p, u) * (1 + 0.012f * sinf(TAU_F * 5.2f * t) + 0.01f * run.jit + vd * sinf(TAU_F * 6 * t));
+        run.ph += f0 / RATE;
+        if (run.ph >= 1.0f) run.ph -= 1.0f;
+        const float pu = run.ph < 0.4f ? 0.5f - 0.5f * cosf(3.1415927f * run.ph / 0.4f)
+                       : run.ph < 0.56f ? cosf(1.5707963f * (run.ph - 0.4f) / 0.16f) : 0.0f;
+        float e = (pu - run.prev) * RATE / (f0 * 7.85f);
+        run.prev = pu;
         const float hs = n < h0 ? 1.0f - (float)n / h0 : 0.0f;    // the h of "hey"
-        e = e * (1 - hs * 0.85f) + r.next() * (br * 0.35f + hs * 0.9f);
+        e = e * (1 - hs * 0.85f) + run.r.next() * (br * 0.35f + hs * 0.9f);
         if ((n & 15) == 0) {
             const float x = u * (nv - 1);
             const int i = nv < 2 ? 0 : (x >= nv - 1 ? nv - 2 : (int)x);
             const float fr = x - i;
             const uint16_t* A = VOWEL[st.v[i]];
             const uint16_t* B = VOWEL[st.v[nv < 2 ? i : i + 1]];
-            for (int k = 0; k < 3; k++) bpSet(c[k], (A[k] + (B[k] - A[k]) * fr) * sz, BANDW[k]);
+            for (int k = 0; k < 3; k++) bpSet(run.c[k], (A[k] + (B[k] - A[k]) * fr) * sz, BANDW[k]);
         }
         float y = 0;
-        for (int k = 0; k < 3; k++) y += bpRun(c[k], z[k], e) * FORM[k];
-        out[n] += y * 1.7f * envLin(st, n, N) * lv;
+        for (int k = 0; k < 3; k++) y += bpRun(run.c[k], run.z[k], e) * FORM[k];
+        out[n - n0] += y * 1.7f * envLin(st, n, N) * lv;
     }
 }
 
-static void renderBell(const Part& st, float* out, int N) {
+static void renderBell(const Part& st, float* out, int n0, int count, int N) {
     const float fc = st.p[0], fm = fc * st.k[0], I = st.k[1], ring = st.k[2] / 1000.0f;
     const float ie = ring * (st.k[3] > 0 ? st.k[3] : 0.5f), lv = st.lv / 100.0f;
-    for (int n = 0; n < N; n++) {
+    const int end = n0 + count;
+    for (int n = n0; n < end; n++) {
         const float t = (float)n / RATE;
         const float v = sinf(TAU_F * fc * t + I * expf(-t / ie) * sinf(TAU_F * fm * t));
-        out[n] += v * 0.55f * envRing(st, n, N, ring) * lv;
+        out[n - n0] += v * 0.55f * envRing(st, n, N, ring) * lv;
     }
 }
 
-static void renderAir(const Part& st, float* out, int N) {
-    Rng r = { 4242 };
+static void renderAir(const Part& st, float* out, int n0, int count, int N, AirRun& run) {
     const float q = st.k[0] > 0 ? st.k[0] : 1.0f, lv = st.lv / 100.0f;
-    float c[4] = {}, z[4] = {};
-    for (int n = 0; n < N; n++) {
-        if ((n & 15) == 0) { const float fc = along(st.p, (float)n / N); bpSet(c, fc, fc / q); }
-        out[n] += bpRun(c, z, r.next()) * 1.4f * envLin(st, n, N) * lv;
+    const int end = n0 + count;
+    for (int n = n0; n < end; n++) {
+        if ((n & 15) == 0) { const float fc = along(st.p, (float)n / N); bpSet(run.c, fc, fc / q); }
+        out[n - n0] += bpRun(run.c, run.z, run.r.next()) * 1.4f * envLin(st, n, N) * lv;
     }
 }
 
@@ -347,6 +369,137 @@ static void* bigAlloc(size_t bytes) {
     return p ? p : malloc(bytes);
 }
 
+#if defined(CYD)
+// One part's place in the mix, and the oscillator state that has to survive
+// from one 16 ms chunk to the next. Held only while a sound plays: a mounted
+// card leaves one block of about 10.7 KB, wardriving pauses under 8 KB, and
+// these buffers plus a task stack are most of that gap.
+struct PartRun {
+    int at, N;
+    bool live;
+    ToneRun tone;
+    VoiceRun voice;
+    AirRun air;
+};
+struct DacWs {
+    PartRun  run[8];
+    float    chunk[CHUNK];
+    uint16_t dac[CHUNK * 2];
+};
+
+static void addPart(const Part& st, PartRun& run, float* chunk, int base, int n) {
+    const int from = base > run.at ? base : run.at;
+    const int to = base + n < run.at + run.N ? base + n : run.at + run.N;
+    if (from >= to) return;
+    float* out = chunk + (from - base);
+    const int n0 = from - run.at, count = to - from;
+    switch (st.kind) {
+        case VOICE: renderVoice(st, out, n0, count, run.N, run.voice); break;
+        case BELL:  renderBell(st, out, n0, count, run.N); break;
+        case AIR:   renderAir(st, out, n0, count, run.N, run.air); break;
+        default:    renderTone(st, out, n0, count, run.N, run.tone); break;
+    }
+}
+
+// Stereo frames, the same sample in both slots. Only the left slot reaches
+// the amp (DAC2, GPIO26). Midscale is silence: the DAC reads the high byte.
+static void writeDac(uint16_t* dac, int frames) {
+    size_t done = 0;
+    i2s_write(PORT, dac, (size_t)frames * 4, &done, portMAX_DELAY);
+}
+static void dacSilence(uint16_t* dac, int ms) {
+    for (int i = 0; i < CHUNK * 2; i++) dac[i] = 0x8000;
+    for (int left = ms * (int)RATE / 1000; left > 0; left -= CHUNK)
+        writeDac(dac, left < CHUNK ? left : CHUNK);
+}
+
+// Installed for one sound and removed after it. Left up, its four 1 KB DMA
+// buffers come out of the 10.7 KB block a mounted card leaves, and wardriving
+// then sits on LOW MEMORY: it pauses once the largest block falls under 8 KB.
+static bool dacInstall() {
+    i2s_config_t cfg = {};
+    cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
+    cfg.sample_rate          = RATE;
+    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_MSB;
+    cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count        = 4;
+    cfg.dma_buf_len          = CHUNK;
+    cfg.use_apll             = false;
+    cfg.tx_desc_auto_clear   = true;
+    cfg.fixed_mclk           = 0;
+    cfg.mclk_multiple        = I2S_MCLK_MULTIPLE_256;
+    cfg.bits_per_chan        = I2S_BITS_PER_CHAN_16BIT;
+    return i2s_driver_install(PORT, &cfg, 0, nullptr) == ESP_OK;
+}
+
+static void playNowDac(const Sound& snd, const int* start, uint8_t parts, int total) {
+    DacWs* ws = (DacWs*)malloc(sizeof(DacWs));
+    if (!ws) { Serial.println("[sound] no memory for the sound"); return; }
+    if (!dacInstall()) {
+        Serial.println("[sound] I2S DAC refused");
+        free(ws);
+        return;
+    }
+    for (uint8_t i = 0; i < parts; i++) {
+        const Part& st = snd.p[i];
+        PartRun& r = ws->run[i];
+        r.at = start[i] * (int)RATE / 1000;
+        r.N = st.ms * (int)RATE / 1000;
+        r.live = r.at >= 0 && r.N > 0 && r.at + r.N <= total;
+        r.tone = ToneRun{ 0, 0x5EED1234u, 0 };
+        r.voice = VoiceRun{};
+        r.voice.r.s = 777;
+        r.air = AirRun{};
+        r.air.r.s = 4242;
+    }
+    const int D = snd.echoMs ? snd.echoMs * (int)RATE / 1000 : 0;
+    float* echo = D ? (float*)malloc((size_t)D * sizeof(float)) : nullptr;
+    if (echo) memset(echo, 0, (size_t)D * sizeof(float));
+    int ei = 0;
+
+    const float pct = (float)Settings::soundVolume() / 100.0f;
+    const float vol = pct * pct * 32000.0f, g = snd.gain > 0 ? snd.gain : 1.0f;
+
+    i2s_start(PORT);
+    dacSilence(ws->dac, 24);  // clocks and midscale before the pad connects: no pop
+    amp(true);
+    dacSilence(ws->dac, 16);
+    for (int base = 0; base < total; ) {
+        const int n = (total - base) < CHUNK ? (total - base) : CHUNK;
+        memset(ws->chunk, 0, (size_t)n * sizeof(float));
+        for (uint8_t i = 0; i < parts; i++) if (ws->run[i].live) addPart(snd.p[i], ws->run[i], ws->chunk, base, n);
+        for (int i = 0; i < n; i++) {
+            float sample = ws->chunk[i];
+            if (echo) {
+                const float z = echo[ei];
+                echo[ei] = sample + z * snd.fb;
+                sample += z * snd.mix;
+                if (++ei == D) ei = 0;
+            }
+            const float v = sample * g, a = fabsf(v);
+            const float o = a < 0.7f ? v : copysignf(0.7f + 0.3f * tanhf((a - 0.7f) / 0.3f), v);
+            int s = (int)(o * vol);
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            const uint16_t u = (uint16_t)(s + 32768);
+            ws->dac[i * 2] = u; ws->dac[i * 2 + 1] = u;
+        }
+        writeDac(ws->dac, n);
+        base += n;
+    }
+    free(echo);
+    dacSilence(ws->dac, 16);
+    amp(false);
+    dacSilence(ws->dac, 24);
+    i2s_zero_dma_buffer(PORT);
+    i2s_stop(PORT);
+    i2s_driver_uninstall(PORT);
+    free(ws);
+}
+#endif
+
 static void playNow(Id id) {
     const Sound& snd = SOUNDS[(int)id];
     // Lay the parts out in time, the way the Lab did.
@@ -359,6 +512,10 @@ static void playNow(Id id) {
         if (start[i] + st.ms + st.gap > t) t = start[i] + st.ms + st.gap;
     }
     const int total = (t + snd.echoMs * 6 + 30) * (int)RATE / 1000;
+#if defined(CYD)
+    playNowDac(snd, start, parts, total);
+    return;
+#endif
     float* mix = (float*)bigAlloc((size_t)total * sizeof(float));
     if (!mix) { Serial.println("[sound] no memory for the sound"); return; }
     memset(mix, 0, (size_t)total * sizeof(float));
@@ -370,10 +527,26 @@ static void playNow(Id id) {
         const int at = start[i] * (int)RATE / 1000, N = st.ms * (int)RATE / 1000;
         if (at < 0 || at + N > total) continue;
         switch (st.kind) {
-            case VOICE: renderVoice(st, mix + at, N); break;
-            case BELL:  renderBell(st, mix + at, N);  break;
-            case AIR:   renderAir(st, mix + at, N);   break;
-            default:    renderTone(st, mix + at, N, lcg, lp); break;
+            case VOICE: {
+                VoiceRun vr{};
+                vr.r.s = 777;
+                renderVoice(st, mix + at, 0, N, N, vr);
+                break;
+            }
+            case BELL:  renderBell(st, mix + at, 0, N, N);  break;
+            case AIR: {
+                AirRun ar{};
+                ar.r.s = 4242;
+                renderAir(st, mix + at, 0, N, N, ar);
+                break;
+            }
+            default: {
+                ToneRun tr{ 0, lcg, lp };
+                renderTone(st, mix + at, 0, N, N, tr);
+                lcg = tr.lcg;
+                lp = tr.lp;
+                break;
+            }
         }
     }
     if (snd.echoMs) {
@@ -424,13 +597,60 @@ static void playNow(Id id) {
 static void soundTask(void*) {
     uint8_t id;
     for (;;) {
+#if defined(CYD)
+        // Idle a tenth of a second, then leave. The stack is the block
+        // wardriving is measured against, so it cannot sit there between sounds.
+        if (xQueueReceive(s_q, &id, pdMS_TO_TICKS(100)) != pdTRUE) {
+            bool leave = false;
+            portENTER_CRITICAL(&s_mux);
+            if (s_task == xTaskGetCurrentTaskHandle()) {
+                s_task = nullptr;
+                leave = true;
+            }
+            portEXIT_CRITICAL(&s_mux);
+            if (leave) vTaskDelete(nullptr);
+            continue;
+        }
+#else
         if (xQueueReceive(s_q, &id, portMAX_DELAY) != pdTRUE) continue;
+#endif
         if (id < (uint8_t)Id::COUNT) playNow((Id)id);
     }
 }
 
+#if defined(CYD)
+// The queue and the task exist only around a sound. Claimed with a stand-in
+// handle so a second play during the create does not start a second task.
+static void ensurePlayer() {
+    portENTER_CRITICAL(&s_mux);
+    const bool start = s_task == nullptr;
+    if (start) s_task = (TaskHandle_t)1;
+    portEXIT_CRITICAL(&s_mux);
+    if (!start) return;
+    if (!s_q) s_q = xQueueCreate(4, sizeof(uint8_t));
+    TaskHandle_t created = nullptr;
+    const BaseType_t ok = s_q
+        ? xTaskCreatePinnedToCore(soundTask, "sound", 4096, nullptr, 2, &created, 1)
+        : pdFAIL;
+    portENTER_CRITICAL(&s_mux);
+    s_task = (ok == pdPASS) ? created : nullptr;
+    portEXIT_CRITICAL(&s_mux);
+    if (ok != pdPASS) Serial.println("[sound] no memory for the player");
+}
+#endif
+
 // ---- the API ---------------------------------------------------------------
 void begin() {
+#if defined(CYD)
+    // Built-in DAC, not a codec. Do not call i2s_set_pin(NULL) or
+    // i2s_set_dac_mode(): both turn on DAC1, and that pad is GPIO25, the
+    // touch clock. The amp is DAC2, GPIO26. Nothing is allocated here: the
+    // driver, the mix buffer and the player task are created for one sound
+    // and freed after it, because a mounted card leaves one block of about
+    // 10.7 KB and wardriving pauses once that block falls under 8 KB.
+    s_ok = true;
+    Serial.println("[sound] CYD amp on DAC2 GPIO26, brought up only while a sound plays");
+#else
     if (PIN_AMP >= 0) pinMode(PIN_AMP, OUTPUT);
     amp(false);
 #if !SOUND_NO_CODEC
@@ -480,6 +700,7 @@ void begin() {
     Serial.printf("[sound] ES8311 id %02X%02X ready: MCK %d BCK %d WS %d DOUT %d, amp on GPIO%d%s\n",
                   id1, id2, PIN_MCK, PIN_BCK, PIN_WS, PIN_DOUT, PIN_AMP, s_ok ? "" : " -- task failed");
 #endif
+#endif
 }
 
 void play(Id id, bool sample) {
@@ -493,6 +714,10 @@ void play(Id id, bool sample) {
         if (Clock::night() && id != Id::WATCH_HIT) return;
     }
     const uint8_t b = (uint8_t)id;
+#if defined(CYD)
+    ensurePlayer();
+    if (!s_task || !s_q) return;
+#endif
     xQueueSend(s_q, &b, 0);        // a full queue drops the sound, not the frame
 }
 
@@ -500,7 +725,7 @@ void hush(bool on) { s_hush = on; }
 
 void quiet() {
     if (!s_ok) return;
-    xQueueReset(s_q);
+    if (s_q) xQueueReset(s_q);
     amp(false);
 }
 

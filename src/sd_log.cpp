@@ -162,10 +162,13 @@ bool SdLog::begin() {
     SPI.begin(18, 19, 23, SD_CS_PIN);  // SCK, MISO, MOSI, CS
     if (!SD.begin(SD_CS_PIN, SPI, 4000000, "/sd", SD_MAX_FILES)) {
 #endif
-        // Said out loud either way: a board with no card, or a card on the
-        // wrong pins, ran exactly like one that was logging, and the only
-        // way to tell was to pull the card and look.
-        Serial.println("[sd] no card, or it did not answer: nothing will be logged");
+        // Said out loud either way: a board with no card, a card on the
+        // wrong pins, or a FAT mount that could not get one contiguous
+        // block (the library logs esp_vfs_fat_register 0x101 just above)
+        // all used to look exactly like a board that was logging.
+        Serial.printf("[sd] not mounted: heap %lu, largest block %lu; nothing will be logged\n",
+                      (unsigned long)ESP.getFreeHeap(),
+                      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         _ready = false;
         return false;
     }

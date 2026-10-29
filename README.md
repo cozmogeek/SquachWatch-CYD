@@ -328,7 +328,7 @@ to three characters. It changes the screen only; nothing stored changes.
 - **POWER OFF** on the Freenove ESP32-S3 2.8" and 3.5": hold **BOOT** for
   three seconds; press it to turn the board back on. (CHARGE MODE is on
   the Settings list there.)
-- **The speaker** on the same two boards and the T-Deck Plus: SOUND in Settings is OFF,
+- **The speaker** on the same two boards, the T-Deck Plus, and the 2.8" CYD (the plug on the board, driven from GPIO 26): SOUND in Settings is OFF,
   ALERTS or ALL, with VOLUME on - and + buttons. Quiet at night and while
   the screen is dimmed, except for a watch-list hit.
 - **LAST RUN** (Settings → SYSTEM): how long the previous power-up lasted.

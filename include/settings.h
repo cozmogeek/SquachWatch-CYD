@@ -305,8 +305,8 @@ namespace Settings {
     void        toggleBuzzer();
 
     // ---- SOUND -----------------------------------------------------------
-    // The Freenove S3 boards' speaker (sound.h). SOUND is 0 OFF (the
-    // default: opt in, like the buzzer), 1 ALERTS (a new device, a watch-list
+    // The speaker (sound.h): Freenove S3, T-Deck Plus, and the 2.8" CYD.
+    // SOUND is 0 OFF (the default: opt in, like the buzzer), 1 ALERTS (a new device, a watch-list
     // hit, a low battery) or 2 ALL (those plus the squad, the throws, the
     // pets and the lamp's cable). VOLUME is a percent, 0..100 in steps of
     // ten from the row's - and + buttons (like BRIGHT). Only the boards with
